@@ -1,0 +1,6 @@
+*.mp4
+*.bin
+__pycache__/
+/nets_png/
+/nets_png_reordered/
+/list.txt
