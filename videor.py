@@ -40,13 +40,13 @@ def render_frame(args):
     # 2. 绘制文字
     parts = png_path.stem.split("_")
     mask = int(parts[2], 16)
-    cx, cy = int(parts[4]), int(parts[5])  # 原始对齐坐标
+    cx, cy = int(parts[4]), int(parts[5])
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 1.2
     font_thickness = 2
 
-    text = f"Index / Mask: {i:05d} / {mask:08X}"
+    text = f"Index / Mask: {i:05d} / {mask:016X}"
     tw, th = get_text_size(text, font, font_scale, font_thickness)
 
     margin = 20

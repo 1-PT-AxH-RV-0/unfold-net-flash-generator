@@ -1,6 +1,9 @@
 *.mp4
 *.bin
+*.off
 __pycache__/
 /nets_png/
+/nets_svg/
 /nets_png_reordered/
 /list.txt
+/unfold

@@ -8,6 +8,8 @@ from pathlib import Path
 from tqdm import tqdm
 from load import load_nets, NetData
 import click
+from multiprocessing import Pool
+
 
 # ============================================================
 # 1. 通用 OFF 解析（含顶点坐标）
@@ -15,25 +17,21 @@ import click
 def parse_off_full(raw_off):
     lines = raw_off.strip().splitlines()
     idx = 0
-    # 跳过空行和 OFF 头
     while idx < len(lines) and lines[idx].strip() == "":
         idx += 1
     if idx >= len(lines) or lines[idx].strip() != "OFF":
         raise ValueError("Invalid OFF: missing OFF header")
     idx += 1
-    # 跳过注释和空行
     while idx < len(lines) and (lines[idx].strip() == "" or lines[idx].strip().startswith("#")):
         idx += 1
     V, F, E = map(int, lines[idx].split())
     idx += 1
-    # 读顶点
     vertices = []
     for _ in range(V):
         parts = lines[idx].split()
         if len(parts) >= 3:
             vertices.append(tuple(map(float, parts[:3])))
         idx += 1
-    # 读面
     faces = []
     for _ in range(F):
         parts = list(map(int, lines[idx].split()))
@@ -57,16 +55,10 @@ def put_text_center(img, text, center, font, font_scale, color, thickness):
 # 3. 局部 2D 参数化（将三维面展平到二维）
 # ============================================================
 def face_local_2d(vertices, face):
-    """
-    为面构建局部 2D 坐标系，返回该面所有顶点在局部平面上的坐标列表。
-    坐标系原点：第一个顶点；x 轴：第一边方向；z：法向；y = z × x。
-    """
     pts = [np.array(vertices[i], dtype=np.float64) for i in face]
     n = len(pts)
     p0 = pts[0]
-    # 寻找不共线的第二、第三点
     p1 = pts[1] if n > 1 else p0 + np.array([1.0, 0.0, 0.0])
-    # 计算法向：使用前三个点，若共线则尝试后续点
     normal = None
     for i in range(2, n):
         v1 = pts[1] - p0
@@ -95,7 +87,6 @@ def face_local_2d(vertices, face):
 # 4. 2D 变换工具
 # ============================================================
 def rotate_point(p, angle):
-    """绕原点旋转点"""
     x, y = p
     c = math.cos(angle)
     s = math.sin(angle)
@@ -103,7 +94,6 @@ def rotate_point(p, angle):
 
 
 def reflect_point(p, p_start, p_end):
-    """点 p 关于直线 (p_start, p_end) 的镜像"""
     ax, ay = p_start
     bx, by = p_end
     px, py = p
@@ -119,9 +109,6 @@ def reflect_point(p, p_start, p_end):
 
 
 def transform_face(local_coords, angle, translation, do_reflect, ref_start, ref_end):
-    """
-    对局部坐标应用变换：旋转、平移，可选反射。
-    """
     result = [rotate_point(pt, angle) for pt in local_coords]
     result = [(x + translation[0], y + translation[1]) for x, y in result]
     if do_reflect:
@@ -130,39 +117,40 @@ def transform_face(local_coords, angle, translation, do_reflect, ref_start, ref_
 
 
 # ============================================================
-# 5. 通用网格展开
+# 5. 通用网格展开（已添加 local_coords / face_vertex_pos 缓存参数）
 # ============================================================
-def unfold_generic(vertices, faces, edges, mask, root_face=0, scale=1.0):
+def unfold_generic(vertices, faces, edges, mask, root_face=0, scale=1.0,
+                   local_coords=None, face_vertex_pos=None):
     """
     根据生成树 mask（边索引的位掩码）展开所有面。
-    返回: face_global_coords: list of list of (x,y)，按面索引存储，坐标已乘以 scale。
+    local_coords 和 face_vertex_pos 可由 worker 预先计算并缓存传入。
     """
-    N = len(faces)          # 面数
-    M = len(edges)          # 边总数
+    N = len(faces)
+    M = len(edges)
 
     # 1. 构建生成树的邻接表（面-面）
     tree_adj = [[] for _ in range(N)]
     for e_idx in range(M):
         if (mask >> e_idx) & 1:
-            u, v = edges[e_idx]    # 两个相邻的面索引
+            u, v = edges[e_idx]
             tree_adj[u].append(v)
             tree_adj[v].append(u)
 
-    # 2. 为每个面预先计算局部 2D 坐标
-    local_coords = [face_local_2d(vertices, f) for f in faces]
+    # 2. 局部 2D 坐标（使用缓存或重新计算）
+    if local_coords is None:
+        local_coords = [face_local_2d(vertices, f) for f in faces]
 
-    # 3. 建立顶点在每个面中的位置索引（便于寻找共享边）
-    # 格式：face_vertex_pos[face_idx][vertex_idx] = 在该面顶点列表中的局部索引列表
-    face_vertex_pos = []
-    for f_idx, face in enumerate(faces):
-        pos_dict = defaultdict(list)
-        for i, v in enumerate(face):
-            pos_dict[v].append(i)
-        face_vertex_pos.append(pos_dict)
+    # 3. 顶点在面中的位置索引（使用缓存或重新计算）
+    if face_vertex_pos is None:
+        face_vertex_pos = []
+        for f_idx, face in enumerate(faces):
+            pos_dict = defaultdict(list)
+            for i, v in enumerate(face):
+                pos_dict[v].append(i)
+            face_vertex_pos.append(pos_dict)
 
-    # 4. 初始化全局坐标（每个面一个坐标列表）
+    # 4. 初始化全局坐标
     global_coords = [None] * N
-    # 放置根面：直接使用局部坐标（稍后会统一缩放）
     global_coords[root_face] = local_coords[root_face][:]
 
     visited = [False] * N
@@ -183,24 +171,17 @@ def unfold_generic(vertices, faces, edges, mask, root_face=0, scale=1.0):
             g_local = local_coords[g]
             g_pos = face_vertex_pos[g]
 
-            # 寻找共享边 (在顶点索引意义上的两个顶点)
-            shared_vertices = None
-            # 只需检查两个面的顶点交集即可
             set_f = set(f_face)
             set_g = set(g_face)
             common = set_f & set_g
-            # 通常共享边由两个顶点组成，若多边形共享一条完整边
             if len(common) < 2:
                 raise RuntimeError(f"面 {f} 和 {g} 没有共享边。")
 
-            # 选择共享边上的两个顶点（取第一个两个）
             common_list = list(common)[:2]
             v_a, v_b = common_list[0], common_list[1]
 
-            # 在 f 中找到这两个点的局部索引，并确保它们构成一条边（相邻）
             indices_f_a = f_pos[v_a]
             indices_f_b = f_pos[v_b]
-            # 找到相邻的索引对
             i_f = j_f = None
             n_f = len(f_face)
             for ia in indices_f_a:
@@ -213,7 +194,6 @@ def unfold_generic(vertices, faces, edges, mask, root_face=0, scale=1.0):
             if i_f is None:
                 raise RuntimeError(f"共享边不在面 {f} 中连续？")
 
-            # 在 g 中同样找到局部索引
             indices_g_a = g_pos[v_a]
             indices_g_b = g_pos[v_b]
             i_g = j_g = None
@@ -228,15 +208,12 @@ def unfold_generic(vertices, faces, edges, mask, root_face=0, scale=1.0):
             if i_g is None:
                 raise RuntimeError(f"共享边不在面 {g} 中连续？")
 
-            # 父面中共享边的两个全局坐标
             p_f_start = f_global[i_f]
             p_f_end = f_global[j_f]
 
-            # 子面中共享边的两个局部坐标
             p_g_local_start = g_local[i_g]
             p_g_local_end = g_local[j_g]
 
-            # 计算旋转角度，使局部边对齐全局边
             vec_f = (p_f_end[0] - p_f_start[0], p_f_end[1] - p_f_start[1])
             vec_g_local = (p_g_local_end[0] - p_g_local_start[0], p_g_local_end[1] - p_g_local_start[1])
 
@@ -244,25 +221,19 @@ def unfold_generic(vertices, faces, edges, mask, root_face=0, scale=1.0):
             angle_g = math.atan2(vec_g_local[1], vec_g_local[0])
             angle = angle_f - angle_g
 
-            # 旋转后平移，使局部起点对齐
             trans_x = p_f_start[0] - (math.cos(angle) * p_g_local_start[0] - math.sin(angle) * p_g_local_start[1])
             trans_y = p_f_start[1] - (math.sin(angle) * p_g_local_start[0] + math.cos(angle) * p_g_local_start[1])
 
-            # 先不加反射，计算第三点方向
             g_global_candidate = transform_face(g_local, angle, (trans_x, trans_y), False, (0,0), (0,0))
 
-            # 检查方向：父面第三点与子面第三点应在共享边两侧
-            # 取父面中不在边上的一个顶点
             f_other_idx = None
             for idx in range(n_f):
                 if idx != i_f and idx != j_f:
                     f_other_idx = idx
                     break
             if f_other_idx is None:
-                # 如果面只有两个顶点？不可能
                 f_other_idx = (i_f + 2) % n_f
 
-            # 子面同样
             g_other_idx = None
             for idx in range(n_g):
                 if idx != i_g and idx != j_g:
@@ -274,14 +245,12 @@ def unfold_generic(vertices, faces, edges, mask, root_face=0, scale=1.0):
             p_f_other = f_global[f_other_idx]
             p_g_other = g_global_candidate[g_other_idx]
 
-            # 计算相对于有向边 (p_f_start -> p_f_end) 的叉积符号
             def side(p, a, b):
                 return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
 
             side_f = side(p_f_other, p_f_start, p_f_end)
             side_g = side(p_g_other, p_f_start, p_f_end)
 
-            # 如果符号相同（或有一个为零），需要反射
             need_reflect = (side_f * side_g >= 0)
 
             g_global_final = transform_face(g_local, angle, (trans_x, trans_y),
@@ -291,7 +260,6 @@ def unfold_generic(vertices, faces, edges, mask, root_face=0, scale=1.0):
             visited[g] = True
             queue.append(g)
 
-    # 应用缩放
     scaled_coords = []
     for face in global_coords:
         if face:
@@ -305,9 +273,6 @@ def unfold_generic(vertices, faces, edges, mask, root_face=0, scale=1.0):
 # 6. 绘制函数（白色线框 + 白色文字，透明背景）
 # ============================================================
 def draw_net_png(face_global_coords, N):
-    """
-    绘制所有面的展开图，返回 (canvas, w, h, face0_center)。
-    """
     xs, ys = [], []
     for coords in face_global_coords:
         if coords:
@@ -353,7 +318,55 @@ def draw_net_png(face_global_coords, N):
 
 
 # ============================================================
-# 7. 主程序
+# 7. 多进程并行处理（内存友好）
+# ============================================================
+_worker_data = {}
+
+def _init_worker(vertices, faces, edges, scale, out_dir, total):
+    """每个工作进程初始化时调用，缓存共享数据避免重复序列化与重复计算。"""
+    _worker_data['vertices'] = vertices
+    _worker_data['faces'] = faces
+    _worker_data['edges'] = edges
+    _worker_data['scale'] = scale
+    _worker_data['out_dir'] = out_dir
+    _worker_data['total_count'] = total
+    _worker_data['N'] = len(faces)
+
+    # 预计算与 mask 无关的数据，避免每个任务重复计算
+    _worker_data['local_coords'] = [face_local_2d(vertices, f) for f in faces]
+    _worker_data['face_vertex_pos'] = []
+    for face in faces:
+        pos_dict = defaultdict(list)
+        for i, v in enumerate(face):
+            pos_dict[v].append(i)
+        _worker_data['face_vertex_pos'].append(pos_dict)
+
+
+def _process_single_mask(args):
+    """处理单个 mask：计算 → 绘制 → 保存。返回 (idx, success, error_msg)"""
+    idx, mask = args
+    d = _worker_data
+    subdir = d['out_dir'] / f"{(idx // 1000) * 1000 + 1}~{min((idx // 1000 + 1) * 1000, d['total_count'])}"
+
+    try:
+        global_coords = unfold_generic(d['vertices'], d['faces'], d['edges'], mask,
+                                       root_face=0, scale=d['scale'],
+                                       local_coords=d['local_coords'],
+                                       face_vertex_pos=d['face_vertex_pos'])
+        canvas, img_w, img_h, (f0_cx, f0_cy) = draw_net_png(global_coords, d['N'])
+        if canvas is None:
+            return (idx, False, "empty canvas")
+
+        subdir.mkdir(exist_ok=True, parents=True)
+        filename = f"net_{idx:05d}_mask_{mask}_size_{img_w}x{img_h}_f0_{f0_cx}_{f0_cy}.png"
+        cv2.imwrite(str(subdir / filename), canvas)
+        return (idx, True, None)
+    except Exception as e:
+        return (idx, False, str(e))
+
+
+# ============================================================
+# 8. 主程序
 # ============================================================
 @click.command()
 @click.option(
@@ -367,19 +380,25 @@ def draw_net_png(face_global_coords, N):
         path_type=str
     )
 )
-def main(nets_path):
-    # 读取 nets.bin
+@click.option(
+    '--scale', '-s',
+    default='50.0',
+    type=float
+)
+@click.option(
+    '--workers', '-w',
+    default=4,
+    type=int,
+    help='并行工作进程数（默认4，建议设为 CPU 核心数）'
+)
+def main(nets_path, scale, workers):
     nd = load_nets(nets_path)
     print(f"网格面数 (N): {nd.N}")
     print(f"邻接边数 (M): {nd.M}")
     print(f"总展开图数量: {len(nd.masks)}")
 
-    # 解析 OFF 得到顶点和面
     vertices, faces = parse_off_full(nd.raw_off)
     print(f"顶点数: {len(vertices)}, 面数: {len(faces)}")
-
-    # ---- 控制展开图整体大小的缩放因子 ----
-    scale = 63
 
     out_dir = Path("nets_png")
     out_dir.mkdir(exist_ok=True)
@@ -387,23 +406,27 @@ def main(nets_path):
         if item.is_dir():
             shutil.rmtree(item)
 
-    for idx, mask in enumerate(tqdm(nd.masks, desc="绘制展开图")):
-        try:
-            global_coords = unfold_generic(vertices, faces, nd.edges, mask,
-                                           root_face=0, scale=scale)
-        except Exception as e:
-            print(f"展开 mask {idx} 失败: {e}")
-            continue
+    total = len(nd.masks)
+    task_gen = ((idx, mask) for idx, mask in enumerate(nd.masks))
 
-        canvas, img_w, img_h, (f0_cx, f0_cy) = draw_net_png(global_coords, nd.N)
-        if canvas is None:
-            continue
+    pool_kwargs = {
+        'processes': workers,
+        'initializer': _init_worker,
+        'initargs': (vertices, faces, nd.edges, scale, out_dir, total)
+    }
+    try:
+        pool = Pool(**pool_kwargs, maxtasksperchild=100)
+    except TypeError:
+        pool = Pool(**pool_kwargs)
 
-        filename = f"net_{idx:05d}_mask_{mask}_size_{img_w}x{img_h}_f0_{f0_cx}_{f0_cy}.png"
-        subdir = out_dir / f"{(idx // 1000) * 1000 + 1}~{min((idx // 1000 + 1) * 1000, len(nd.masks))}"
-        subdir.mkdir(exist_ok=True)
-
-        cv2.imwrite(str(subdir / filename), canvas)
+    with pool:
+        for idx, success, error in tqdm(
+            pool.imap_unordered(_process_single_mask, task_gen, chunksize=1),
+            total=total, desc="绘制展开图"
+        ):
+            if not success:
+                if error != "empty canvas":
+                    print(f"展开 mask {idx} 失败: {error}")
 
     print("完成。")
 
