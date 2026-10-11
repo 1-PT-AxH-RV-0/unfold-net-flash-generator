@@ -8,6 +8,8 @@ from load import load_nets, NetData
 import shutil
 import click
 from multiprocessing import Pool
+import io
+from fpdf import FPDF
 
 
 # ============================================================
@@ -251,9 +253,10 @@ def unfold_generic(vertices, faces, edges, mask, root_face=0, scale=1.0,
 
 
 # ============================================================
-# 5. 绘制函数（SVG 字符串，白色线框 + 白色文字，透明背景）
+# 5. 绘制函数（SVG 字符串，黑色线框，透明背景，无文字）
 # ============================================================
-def draw_net_svg(face_global_coords, N):
+# 注：文字在 PDF 层用 fpdf2 直接绘制，避免 SVG <text> 兼容性问题
+def draw_net_svg(face_global_coords, N, stroke_width=0.4):
     xs, ys = [], []
     for coords in face_global_coords:
         if coords:
@@ -262,9 +265,9 @@ def draw_net_svg(face_global_coords, N):
                 ys.append(y)
 
     if not xs:
-        return "", 0, 0, (-1, -1)
+        return "", 0, 0
 
-    margin = 60
+    margin = 10
     min_x, max_x = min(xs) - margin, max(xs) + margin
     min_y, max_y = min(ys) - margin, max(ys) + margin
 
@@ -278,9 +281,7 @@ def draw_net_svg(face_global_coords, N):
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
     ]
 
-    face0_center = (-1, -1)
-
-    for i, coords in enumerate(face_global_coords):
+    for coords in face_global_coords:
         if not coords:
             continue
 
@@ -288,40 +289,29 @@ def draw_net_svg(face_global_coords, N):
         points_str = " ".join(f"{px:.2f},{py:.2f}" for px, py in pts)
 
         svg_parts.append(
-            f'<polygon points="{points_str}" fill="none" stroke="#F0F0F0" stroke-width="2" stroke-linejoin="round"/>'
+            f'<polygon points="{points_str}" fill="none" stroke="#000000" stroke-width="{stroke_width}" stroke-linejoin="round"/>'
         )
-
-        cx = sum(p[0] for p in pts) / len(pts)
-        cy = sum(p[1] for p in pts) / len(pts)
-        # 恢复面号文字标注
-        svg_parts.append(
-            f'<text x="{cx:.2f}" y="{cy:.2f}" fill="#F0F0F0" font-family="sans-serif" font-size="24" '
-            f'text-anchor="middle" dominant-baseline="central">{i}</text>'
-        )
-
-        if i == 0:
-            face0_center = (int(round(cx)), int(round(cy)))
 
     svg_parts.append('</svg>')
     svg_str = "\n".join(svg_parts)
 
-    return svg_str, w, h, face0_center
+    return svg_str, w, h
 
 
 # ============================================================
-# 6. 多进程并行处理（内存友好）
+# 6. 多进程并行计算（只计算 SVG 和尺寸，不写文件）
 # ============================================================
 _worker_data = {}
 
-def _init_worker(vertices, faces, edges, scale, out_dir, total):
+def _init_worker(vertices, faces, edges, scale, total, stroke_width):
     """每个工作进程初始化时调用，缓存共享数据避免重复序列化与重复计算。"""
     _worker_data['vertices'] = vertices
     _worker_data['faces'] = faces
     _worker_data['edges'] = edges
     _worker_data['scale'] = scale
-    _worker_data['out_dir'] = out_dir
     _worker_data['total_count'] = total
     _worker_data['N'] = len(faces)
+    _worker_data['stroke_width'] = stroke_width
 
     # 预计算与 mask 无关的数据
     _worker_data['local_coords'] = [face_local_2d(vertices, f) for f in faces]
@@ -333,32 +323,124 @@ def _init_worker(vertices, faces, edges, scale, out_dir, total):
         _worker_data['face_vertex_pos'].append(pos_dict)
 
 
-def _process_single_mask(args):
-    """处理单个 mask：计算 → 绘制 → 保存。返回 (idx, success, error_msg)"""
+def _compute_single(args):
+    """处理单个 mask：计算展开图 → 返回 SVG 和尺寸。
+    返回 (idx, mask, svg_str, w, h, success, error_msg)"""
     idx, mask = args
     d = _worker_data
-    subdir = d['out_dir'] / f"{(idx // 1000) * 1000 + 1}~{min((idx // 1000 + 1) * 1000, d['total_count'])}"
 
     try:
         global_coords = unfold_generic(d['vertices'], d['faces'], d['edges'], mask,
                                        root_face=0, scale=d['scale'],
                                        local_coords=d['local_coords'],
                                        face_vertex_pos=d['face_vertex_pos'])
-        svg_str, img_w, img_h, (f0_cx, f0_cy) = draw_net_svg(global_coords, d['N'])
+        svg_str, img_w, img_h = draw_net_svg(global_coords, d['N'], stroke_width=d['stroke_width'])
         if not svg_str:
-            return (idx, False, "empty svg")
-
-        subdir.mkdir(exist_ok=True, parents=True)
-        filename = f"net_{idx:05d}_mask_{mask}_size_{img_w}x{img_h}_f0_{f0_cx}_{f0_cy}.svg"
-        filepath = subdir / filename
-        filepath.write_text(svg_str, encoding='utf-8')
-        return (idx, True, None)
+            return (idx, mask, None, 0, 0, False, "empty svg")
+        return (idx, mask, svg_str, img_w, img_h, True, None)
     except Exception as e:
-        return (idx, False, str(e))
+        return (idx, mask, None, 0, 0, False, str(e))
 
 
 # ============================================================
-# 7. 主程序（CLI）
+# 7. PDF 写入（单线程，带 tqdm）
+# ============================================================
+def write_pdf(results, out_pdf, page_w, page_h, cols, rows, padding, text_height,
+              label_font_size, mask_font_size, grid_line_width):
+    """
+    单线程将展开图写入 PDF。
+    results: list of (idx, mask, svg_str, w, h, success, error)
+    """
+    valid = [r for r in results if r[5]]
+    if not valid:
+        print("没有有效的展开图，跳过 PDF 生成。")
+        return
+
+    # 统一缩放比：从尺寸最大（长或宽）的展开图计算
+    max_dim = max(max(r[3], r[4]) for r in valid)
+    cell_w = page_w / cols
+    cell_h = page_h / rows
+    avail_w = cell_w - 2 * padding
+    avail_h = cell_h - text_height - 2 * padding
+    avail_size = min(avail_w, avail_h)
+
+    if max_dim <= 0:
+        scale = 1.0
+    else:
+        scale = avail_size / max_dim
+    scale = 0.876190
+
+    print(f"页面: {page_w}mm × {page_h}mm, 网格: {cols}×{rows}")
+    print(f"单元格: {cell_w:.1f}mm × {cell_h:.1f}mm, 统一缩放比例: {scale:.6f}")
+    print(f"最大展开图 max(宽,高): {max_dim:.1f}px, 有效展开图: {len(valid)}")
+
+    pdf = FPDF(unit="mm", format=(page_w, page_h))
+    pdf.set_auto_page_break(False)
+
+    nets_per_page = cols * rows
+    total_pages = math.ceil(len(valid) / nets_per_page)
+
+    pbar = tqdm(total=len(valid), desc="写入 PDF")
+
+    for page_idx in range(total_pages):
+        pdf.add_page()
+        page_nets = valid[page_idx * nets_per_page:(page_idx + 1) * nets_per_page]
+
+        for i, (idx, mask, svg_str, w, h, _, _) in enumerate(page_nets):
+            row = i // cols
+            col = i % cols
+            cell_x = col * cell_w
+            cell_y = row * cell_h
+
+            # ---- 绘制网格线（cell 边框）----
+            if grid_line_width > 0:
+                pdf.set_draw_color(180, 180, 180)
+                pdf.set_line_width(grid_line_width)
+                pdf.rect(cell_x, cell_y, cell_w, cell_h, style="D")
+
+            # ---- 左上角标签：序号 + 16 位 mask ----
+            label_x = cell_x + padding
+            label_y = cell_y + padding
+
+            pdf.set_xy(label_x, label_y)
+            pdf.set_font("Helvetica", "B", label_font_size)
+            pdf.set_text_color(0, 0, 0)
+            pdf.cell(0, label_font_size * 0.45, f"#{idx + 576*1000}", new_x="LMARGIN", new_y="NEXT")
+
+            pdf.set_xy(label_x, label_y + label_font_size * 0.5)
+            pdf.set_font("Helvetica", "", mask_font_size)
+            pdf.cell(0, mask_font_size * 0.4, f"mask={mask:016X}", new_x="LMARGIN", new_y="NEXT")
+
+            # ---- 嵌入 SVG（统一比例缩放，cell 内居中）----
+            scaled_w = w * scale
+            scaled_h = h * scale
+
+            # 在 cell 内居中（标签区域下方）
+            img_x = cell_x + (cell_w - scaled_w) / 2
+            img_y = cell_y + text_height + (cell_h - text_height - scaled_h) / 2
+
+            # 边界保护
+            if scaled_w > avail_w:
+                scaled_w = avail_w
+            if scaled_h > avail_h:
+                scaled_h = avail_h
+            if img_x < cell_x + padding:
+                img_x = cell_x + padding
+            if img_y < cell_y + text_height:
+                img_y = cell_y + text_height
+
+            svg_bytes = io.BytesIO(svg_str.encode('utf-8'))
+            pdf.image(svg_bytes, x=img_x, y=img_y, w=scaled_w, h=scaled_h)
+
+            pbar.update(1)
+
+    pbar.close()
+    pdf.output(out_pdf)
+    print(f"PDF 已保存: {out_pdf}")
+
+
+# ============================================================
+# 8. 主程序（CLI）
 # ============================================================
 @click.command()
 @click.option(
@@ -375,7 +457,8 @@ def _process_single_mask(args):
 @click.option(
     '--scale', '-s',
     default='30.0',
-    type=float
+    type=float,
+    help='展开图内部坐标缩放（默认 30.0）'
 )
 @click.option(
     '--workers', '-w',
@@ -383,8 +466,64 @@ def _process_single_mask(args):
     type=int,
     help='并行工作进程数（默认4，建议设为 CPU 核心数）'
 )
-def main(nets_path, scale, workers):
+@click.option(
+    '--cols', '-c',
+    default=8,
+    type=int,
+    help='每行网格数（默认 8）'
+)
+@click.option(
+    '--rows', '-r',
+    default=8,
+    type=int,
+    help='每列网格数（默认 8）'
+)
+@click.option(
+    '--page_w', '-pw',
+    default=1600.0,
+    type=float,
+    help='页面宽度 mm（默认 1600）'
+)
+@click.option(
+    '--page_h', '-ph',
+    default=1600.0,
+    type=float,
+    help='页面高度 mm（默认 1600）'
+)
+@click.option(
+    '--stroke_width', '-sw',
+    default=0.4,
+    type=float,
+    help='SVG 描边粗细，单位 px（默认 0.4）'
+)
+@click.option(
+    '--label_font_size', '-lfs',
+    default=16,
+    type=float,
+    help='左上角序号标签字体大小（默认 16）'
+)
+@click.option(
+    '--mask_font_size', '-mfs',
+    default=14,
+    type=float,
+    help='左上角 mask 标签字体大小（默认 14）'
+)
+@click.option(
+    '--grid_line_width', '-glw',
+    default=0.2,
+    type=float,
+    help='网格线粗细，单位 mm（默认 0.2，设为 0 则不绘制）'
+)
+@click.option(
+    '--out_pdf', '-o',
+    default='nets.pdf',
+    type=str,
+    help='输出 PDF 文件名'
+)
+def main(nets_path, scale, workers, cols, rows, page_w, page_h, stroke_width,
+         label_font_size, mask_font_size, grid_line_width, out_pdf):
     nd = load_nets(nets_path)
+    nd.masks = nd.masks[576*1000:576*1200]
     print(f"网格面数 (N): {nd.N}")
     print(f"邻接边数 (M): {nd.M}")
     print(f"总展开图数量: {len(nd.masks)}")
@@ -392,33 +531,39 @@ def main(nets_path, scale, workers):
     vertices, faces = parse_off_full(nd.raw_off)
     print(f"顶点数: {len(vertices)}, 面数: {len(faces)}")
 
-    out_dir = Path("nets_svg")
-    out_dir.mkdir(exist_ok=True)
-    for item in out_dir.iterdir():
-        if item.is_dir():
-            shutil.rmtree(item)
-
     total = len(nd.masks)
     task_gen = ((idx, mask) for idx, mask in enumerate(nd.masks))
 
     pool_kwargs = {
         'processes': workers,
         'initializer': _init_worker,
-        'initargs': (vertices, faces, nd.edges, scale, out_dir, total)
+        'initargs': (vertices, faces, nd.edges, scale, total, stroke_width)
     }
     try:
         pool = Pool(**pool_kwargs, maxtasksperchild=100)
     except TypeError:
         pool = Pool(**pool_kwargs)
 
+    results = []
     with pool:
-        for idx, success, error in tqdm(
-            pool.imap_unordered(_process_single_mask, task_gen, chunksize=1),
-            total=total, desc="绘制展开图"
+        for result in tqdm(
+            pool.imap_unordered(_compute_single, task_gen, chunksize=1),
+            total=total, desc="计算展开图"
         ):
+            results.append(result)
+            idx, _, _, _, _, success, error = result
             if not success:
                 if error != "empty svg":
                     print(f"展开 mask {idx} 失败: {error}")
+
+    # 按 idx 排序，修复多线程乱序问题
+    results.sort(key=lambda r: r[0])
+
+    # 单线程写入 PDF（内部带 tqdm）
+    padding = 5.0       # mm，cell 内边距
+    text_height = max(label_font_size, mask_font_size) * 0.9 + 2.0  # mm，标签区域高度
+    write_pdf(results, out_pdf, page_w, page_h, cols, rows, padding, text_height,
+              label_font_size, mask_font_size, grid_line_width)
 
     print("完成。")
 
